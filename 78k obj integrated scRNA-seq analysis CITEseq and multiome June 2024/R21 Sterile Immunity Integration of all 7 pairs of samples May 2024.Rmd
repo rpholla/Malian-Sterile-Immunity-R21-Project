@@ -1,0 +1,759 @@
+---
+title: "R21 Sterile Immunity Integration of all 7 pairs of samples May 2024"
+author: "Prasida Holla"
+date: "2024-05-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Objective: 
+1. Import CITE-seq ex vivo and multiome ex vivo cellranger outs and geenrate Seurat objects using Seurat 5.
+2. For CITE-seq, keep Hashtag ADTs in a spearate assay and other ADT markers separate.
+3. 
+4. Integrate data across all samples.
+5. Run dimensionality reduction
+6. Annotate celltypes by reference mapping (Azimuth)
+7. Add all metadata variables to the Seurat object- those used for generating Supp Figures and statistical comparisons
+8. Use this object in DEG analysis and GSEA in a separate markdown.
+9. We are aiming for ~92K cells after filtering and integration
+
+ 
+5. Generate uMAP plots at low and high resolution. Sanity check: Check cell type frequencies across samples from this integrated dataset matches with initial frequency assessments
+
+# Load packages
+```{r}
+library(Seurat) 
+library(SeuratWrappers)
+library(patchwork)
+library(SeuratDisk)
+library(tidyverse)
+library(googledrive)
+library(ggpubr)
+library(scales)
+library(RColorBrewer)
+library(viridis)
+library(glue)
+library(MAST)
+library(future)
+library(Signac)
+library(EnsDb.Hsapiens.v86)
+library(MAST)
+library(Azimuth)
+library(zscorer)
+```
+
+# Step 1: Create individual subjects' Seurat objects from CITE-seq by demultiplexing pools
+
+# 1.1. Import all cellranger outs for pools 1->4
+```{r}
+# Import cellranger outs for CITE-seq samples
+pool1_data <- Read10X(data.dir = "~/Desktop/R21 Sterile Immunity data and scripts/CITE-seq/Ex vivo/Cellranger outs/Pool 1/raw_feature_bc_matrix/")
+pool2_data <- Read10X(data.dir = "~/Desktop/R21 Sterile Immunity data and scripts/CITE-seq/Ex vivo/Cellranger outs/Pool 2/raw_feature_bc_matrix/")
+pool3_data <- Read10X(data.dir = "~/Desktop/R21 Sterile Immunity data and scripts/CITE-seq/Ex vivo/Cellranger outs/Pool 3/raw_feature_bc_matrix/")
+pool4_data <- Read10X(data.dir = "~/Desktop/R21 Sterile Immunity data and scripts/CITE-seq/Ex vivo/Cellranger outs/Pool 4/raw_feature_bc_matrix/")
+```
+
+# 1.2 Create RNA, HTO and ADT assays
+```{r}
+#################################### Pool 1 ########################################
+pool1_rna <- pool1_data$`Gene Expression` 
+pool1_prot <- pool1_data$`Antibody Capture`
+View(data.frame(rownames(pool1_data$`Antibody Capture`)))
+ADTs <- pool1_data$`Antibody Capture`@Dimnames[[1]][3:37]
+ADT <- pool1_data$`Antibody Capture`[ADTs, ]
+HTOs <- pool1_data$`Antibody Capture`@Dimnames[[1]][1:2]
+HTO <- pool1_data$`Antibody Capture`[HTOs, ]
+all.equal(colnames(pool1_rna), colnames(pool1_prot), colnames(pool1_hto))
+#seurat pool1
+pool1 <- CreateSeuratObject(counts = pool1_rna, project = "pool1")
+pool1_adt_assay <- CreateAssayObject(counts = ADT[,colnames(x=pool1)])
+pool1[["ADT"]] <- pool1_adt_assay
+pool1_hto_assay <- CreateAssayObject(counts = HTO[,colnames(x=pool1)])
+pool1[["HTO"]] <- pool1_hto_assay
+
+# Filter and QC
+pool1[["percent.mt"]] <- PercentageFeatureSet(pool1, pattern = "^MT-")
+pool1 <- subset(pool1, subset = nFeature_RNA > 200 & nFeature_RNA < 3000 & percent.mt < 20)
+
+# Normalize RNA counts and find variable features
+#pool1 <- NormalizeData(pool1, normalization.method = "LogNormalize", scale.factor = 10000)
+#pool1 <- FindVariableFeatures(pool1, selection.method = "vst", nfeatures = 2000)
+
+# Normalize HTO for deconvolution of individual subjects later
+p1<- NormalizeData(pool1, normalization.method = "CLR", margin = 2, assay = "HTO")
+
+#################################### Pool 2 ########################################
+pool2_rna <- pool2_data$`Gene Expression` 
+pool2_prot <- pool2_data$`Antibody Capture`
+View(data.frame(rownames(pool2_data$`Antibody Capture`)))
+ADTs <- pool2_data$`Antibody Capture`@Dimnames[[1]][3:37]
+ADT <- pool2_data$`Antibody Capture`[ADTs, ]
+HTOs <- pool2_data$`Antibody Capture`@Dimnames[[1]][1:2]
+HTO <- pool2_data$`Antibody Capture`[HTOs, ]
+all.equal(colnames(pool2_rna), colnames(pool2_prot), colnames(pool2_hto))
+#seurat pool2 rep1
+pool2 <- CreateSeuratObject(counts = pool2_rna, project = "pool2-rep1")
+pool2_adt_assay <- CreateAssayObject(counts = ADT[,colnames(x=pool2)])
+pool2[["ADT"]] <- pool2_adt_assay
+pool2_hto_assay <- CreateAssayObject(counts = HTO[,colnames(x=pool2)])
+pool2[["HTO"]] <- pool2_hto_assay
+
+# Filter and QC
+pool2[["percent.mt"]] <- PercentageFeatureSet(pool2, pattern = "^MT-")
+pool2 <- subset(pool2, subset = nFeature_RNA > 200 & nFeature_RNA < 3000 & percent.mt < 20)
+
+# Normalize RNA counts and find variable features
+#pool2 <- NormalizeData(pool2, normalization.method = "LogNormalize", scale.factor = 10000)
+#pool2 <- FindVariableFeatures(pool2, selection.method = "vst", nfeatures = 2000)
+
+# Normalize HTO for deconvolution of individual subjects later
+p2<- NormalizeData(pool2, normalization.method = "CLR", margin = 2, assay = "HTO")
+
+#################################### Pool 3 ########################################
+pool3_rna <- pool3_data$`Gene Expression` 
+pool3_prot <- pool3_data$`Antibody Capture`
+View(data.frame(rownames(pool3_data$`Antibody Capture`)))
+ADTs <- pool3_data$`Antibody Capture`@Dimnames[[1]][3:37]
+ADT <- pool3_data$`Antibody Capture`[ADTs, ]
+HTOs <- pool3_data$`Antibody Capture`@Dimnames[[1]][1:2]
+HTO <- pool3_data$`Antibody Capture`[HTOs, ]
+all.equal(colnames(pool3_rna), colnames(pool3_prot), colnames(pool3_hto))
+#seurat pool3 rep1
+pool3 <- CreateSeuratObject(counts = pool3_rna, project = "pool3-rep1")
+pool3_adt_assay <- CreateAssayObject(counts = ADT[,colnames(x=pool3)])
+pool3[["ADT"]] <- pool3_adt_assay
+pool3_hto_assay <- CreateAssayObject(counts = HTO[,colnames(x=pool3)])
+pool3[["HTO"]] <- pool3_hto_assay
+
+# Filter and QC
+pool3[["percent.mt"]] <- PercentageFeatureSet(pool3, pattern = "^MT-")
+pool3 <- subset(pool3, subset = nFeature_RNA > 200 & nFeature_RNA < 3000 & percent.mt < 20)
+
+# Normalize RNA counts and find variable features
+#pool3 <- NormalizeData(pool3, normalization.method = "LogNormalize", scale.factor = 10000)
+#pool3 <- FindVariableFeatures(pool3, selection.method = "vst", nfeatures = 2000)
+
+# Normalize HTO for deconvolution of individual subjects later
+p3<- NormalizeData(pool3, normalization.method = "CLR", margin = 2, assay = "HTO")
+
+#################################### Pool 4 ########################################
+pool4_rna <- pool4_data$`Gene Expression` 
+pool4_prot <- pool4_data$`Antibody Capture`
+View(data.frame(rownames(pool4_data$`Antibody Capture`)))
+ADTs <- pool4_data$`Antibody Capture`@Dimnames[[1]][3:37]
+ADT <- pool4_data$`Antibody Capture`[ADTs, ]
+HTOs <- pool4_data$`Antibody Capture`@Dimnames[[1]][1:2]
+HTO <- pool4_data$`Antibody Capture`[HTOs, ]
+all.equal(colnames(pool4_rna), colnames(pool4_prot), colnames(pool4_hto))
+#seurat pool4 rep1
+pool4 <- CreateSeuratObject(counts = pool4_rna, project = "pool4-rep1")
+pool4_adt_assay <- CreateAssayObject(counts = ADT[,colnames(x=pool4)])
+pool4[["ADT"]] <- pool4_adt_assay
+pool4_hto_assay <- CreateAssayObject(counts = HTO[,colnames(x=pool4)])
+pool4[["HTO"]] <- pool4_hto_assay
+
+# Filter and QC
+pool4[["percent.mt"]] <- PercentageFeatureSet(pool4, pattern = "^MT-")
+pool4 <- subset(pool4, subset = nFeature_RNA > 200 & nFeature_RNA < 3000 & percent.mt < 20)
+
+# Normalize RNA counts and find variable features
+#pool4 <- NormalizeData(pool4, normalization.method = "LogNormalize", scale.factor = 10000)
+#pool4 <- FindVariableFeatures(pool4, selection.method = "vst", nfeatures = 2000)
+
+# Normalize HTO for deconvolution of individual subjects later
+p4<- NormalizeData(pool4, normalization.method = "CLR", margin = 2, assay = "HTO")
+
+```
+
+# 1.3 Demultiplex pools based on HTOs- remove doublets and negatives
+```{r}
+#################################### Pool 1 #######################################
+d1 <- p1
+DefaultAssay(d1) <- "HTO"
+d1 <- MULTIseqDemux(d1)
+table(d1$MULTI_classification)
+Idents(d1) <- "MULTI_ID"
+pool1_demul <- subset(d1, idents = "Negative", invert = TRUE)
+#pool1_demul <- subset(pool1_demul, idents = "Doublet", invert = TRUE) 
+
+#################################### Pool 2 #######################################
+d2 <- p2
+DefaultAssay(d2) <- "HTO"
+d2 <- MULTIseqDemux(d2)
+table(d2$MULTI_classification)
+Idents(d2) <- "MULTI_ID"
+pool2_demul <- subset(d2, idents = "Negative", invert = TRUE)
+#pool2_demul <- subset(pool2_demul, idents = "Doublet", invert = TRUE) 
+
+#################################### Pool 3 #######################################
+d3 <- p3
+DefaultAssay(d3) <- "HTO"
+d3 <- MULTIseqDemux(d3)
+table(d3$MULTI_classification)
+Idents(d3) <- "MULTI_ID"
+pool3_demul <- subset(d3, idents = "Negative", invert = TRUE)
+#pool3_demul <- subset(pool3_demul, idents = "Doublet", invert = TRUE) 
+
+#################################### Pool 4 #######################################
+d4 <- p4
+DefaultAssay(d4) <- "HTO"
+d4 <- MULTIseqDemux(d4)
+table(d4$MULTI_classification)
+Idents(d4) <- "MULTI_ID"
+pool4_demul <- subset(d4, idents = "Negative", invert = TRUE)
+#pool4_demul <- subset(pool3_demul, idents = "Doublet", invert = TRUE) 
+
+```
+
+# 1.4 Split CITE-seq samples into individual subjects' data
+```{r}
+S1 <- subset(pool1_demul, idents = "S1-Ex-vivo-PBMCs-kali0666-081621")
+S2 <- subset(pool1_demul, idents = "S2-Ex-vivo-PBMCs-kali0618-081621")
+S3 <- subset(pool2_demul, idents = "S3-Ex-vivo-PBMCs-kali0626-081621")
+S4 <- subset(pool2_demul, idents = "S4-Ex-vivo-PBMCs-kali0636-081621")
+S5 <- subset(pool3_demul, idents = "S5-Ex-vivo-PBMCs-kali0650-081621")
+S6 <- subset(pool3_demul, idents = "S6-Ex-vivo-PBMCs-kali0628-081621")
+S7 <- subset(pool4_demul, idents = "S7-Ex-vivo-PBMCs-kali0640-081621")
+S8 <- subset(pool4_demul, idents = "S8-Ex-vivo-PBMCs-kali0604-081621")
+```
+
+# Filter out high mitochondrial gene content cells
+```{r}
+
+DefaultAssay(S1)<-"RNA"
+DefaultAssay(S2)<-"RNA"
+DefaultAssay(S3)<-"RNA"
+DefaultAssay(S4)<-"RNA"
+DefaultAssay(S5)<-"RNA"
+DefaultAssay(S6)<-"RNA"
+DefaultAssay(S7)<-"RNA"
+DefaultAssay(S8)<-"RNA"
+
+orig.cite.dims<-table(dim(S1), dim(S2), dim(S3), dim(S4), dim(S5), dim(S6), dim(S7), dim(S8))
+
+citeseq_samples<-c(S1,
+                   S2,
+                   S3,
+                   S4,
+                   S5,
+                   S6,
+                   S7,
+                   S8)
+
+n<-c("S1",
+     "S2",
+     "S3",
+     "S4",
+     "S5",
+     "S6",
+     "S7",
+     "S8")
+names(citeseq_samples)<-n
+
+citeseq_samples <- lapply(names(citeseq_samples),function(x) {
+  PercentageFeatureSet(citeseq_samples[[x]], "^MT-", col.name = "percent.mt")
+})
+names(citeseq_samples)<-n
+
+for (i in 1:length(citeseq_samples)) {
+  citeseq_samples[[i]] <- subset(citeseq_samples[[i]], percent.mt<5)
+}
+
+# unlist
+S1<-citeseq_samples$S1
+S2<-citeseq_samples$S2
+S3<-citeseq_samples$S3
+S4<-citeseq_samples$S4
+S5<-citeseq_samples$S5
+S6<-citeseq_samples$S6
+S7<-citeseq_samples$S7
+S8<-citeseq_samples$S8
+
+new.cite.dims<-table(dim(S1), dim(S2), dim(S3), dim(S4), dim(S5), dim(S6), dim(S7), dim(S8))
+```
+
+# Step 2: Import multiome data and create indivudal subjects' Seurat objects
+
+# 2.1. Import Cellranger outs
+```{r}
+# Jun 2022
+S9<-Read10X_h5("~/Desktop/R21 Sterile Immunity data and scripts/Multiome/Batch 1- 29th June 2022/Cellranger outs/Kali0585_Aparasitemic/filtered_feature_bc_matrix.h5")
+S10<-Read10X_h5("~/Desktop/R21 Sterile Immunity data and scripts/Multiome/Batch 1- 29th June 2022/Cellranger outs/Kali0631_Aparasitemic/filtered_feature_bc_matrix.h5")
+# Para
+S11<-Read10X_h5("~/Desktop/R21 Sterile Immunity data and scripts/Multiome/Batch 1- 29th June 2022/Cellranger outs/Kali0593_Parasitemic/filtered_feature_bc_matrix.h5")
+S12<-Read10X_h5("~/Desktop/R21 Sterile Immunity data and scripts/Multiome/Batch 1- 29th June 2022/Cellranger outs/Kali0600_Parasitemic/filtered_feature_bc_matrix.h5")
+
+# Jan 2023
+# Apara 
+#k613<-Read10X_h5("~/Desktop/R21 Sterile Immunity data and scripts/Multiome/Batch 2- 11th 12th January 2023/Cellranger outs/S1_Kali0613_filtered_feature_bc_matrix.h5")
+S13<-Read10X_h5("~/Desktop/R21 Sterile Immunity data and scripts/Multiome/Batch 2- 11th 12th January 2023/Cellranger outs/S2_Kali0647_filtered_feature_bc_matrix.h5")
+# Para
+S14<-Read10X_h5("~/Desktop/R21 Sterile Immunity data and scripts/Multiome/Batch 2- 11th 12th January 2023/Cellranger outs/S3_Kali0651_filtered_feature_bc_matrix.h5")
+#k612<-Read10X_h5("~/Desktop/R21 Sterile Immunity data and scripts/Multiome/Batch 2- 11th 12th January 2023/Cellranger outs/S4_Kali0612_filtered_feature_bc_matrix.h5")
+```
+
+# 2.1 Create gene expression and ATAC assays (note: ATAC assays will be lost upon integration, but for ATAC-seq analysis, pre-integration objects can be used/ exported from here). Note: Crete MT gene column to filter in subsequent chunk
+```{r}
+###########################S9#############################################
+# extract RNA and ATAC data
+S9_rna_counts <- S9$`Gene Expression`
+S9_atac_counts <- S9$Peaks
+
+# Create Seurat object
+S9 <- CreateSeuratObject(counts = S9_rna_counts)
+S9[["percent.mt"]] <- PercentageFeatureSet(S9, pattern = "^MT-")
+
+# Now add in the ATAC-seq data
+# we'll only use peaks in standard chromosomes
+S9_grange.counts <- StringToGRanges(rownames(S9_atac_counts), sep = c(":", "-"))
+S9_grange.use <- seqnames(S9_grange.counts) %in% standardChromosomes(S9_grange.counts)
+S9_atac_counts <- S9_atac_counts[as.vector(S9_grange.use), ]
+S9_annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+# The order of commands has been flipped here, based on this thread- https://github.com/stuart-lab/signac/issues/826 to avoid erros with the genomeInfoDb package that use a newer version of the hg38
+genome(S9_annotations) <- "hg38"
+seqlevelsStyle(S9_annotations) <- 'UCSC'
+
+S9_frag.file <- "~/Desktop/R21 Sterile Immunity data and scripts/Multiome/Batch 1- 29th June 2022/Frag files/Kali0585_Aparasitemic/atac_fragments.tsv.gz"
+
+S9_chrom_assay <- CreateChromatinAssay(
+  counts = S9_atac_counts,
+  sep = c(":", "-"),
+  #genome = 'hg38', # see github issue with Signac, above
+  fragments = S9_frag.file,
+  min.cells = 10,
+  annotation = S9_annotations
+)
+S9[["ATAC"]] <- S9_chrom_assay
+
+###########################S10#############################################
+# extract RNA and ATAC data
+S10_rna_counts <- S10$`Gene Expression`
+S10_atac_counts <- S10$Peaks
+
+# Create Seurat object
+S10 <- CreateSeuratObject(counts = S10_rna_counts)
+S10[["percent.mt"]] <- PercentageFeatureSet(S10, pattern = "^MT-")
+
+# Now add in the ATAC-seq data
+# we'll only use peaks in standard chromosomes
+S10_grange.counts <- StringToGRanges(rownames(S10_atac_counts), sep = c(":", "-"))
+S10_grange.use <- seqnames(S10_grange.counts) %in% standardChromosomes(S10_grange.counts)
+S10_atac_counts <- S10_atac_counts[as.vector(S10_grange.use), ]
+S10_annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+# The order of commands has been flipped here, based on this thread- https://github.com/stuart-lab/signac/issues/826 to avoid erros with the genomeInfoDb package that use a newer version of the hg38
+genome(S10_annotations) <- "hg38"
+seqlevelsStyle(S10_annotations) <- 'UCSC'
+
+S10_frag.file <- "~/Desktop/R21 Sterile Immunity data and scripts/Multiome/Batch 1- 29th June 2022/Frag files/Kali0631_Aparasitemic/atac_fragments.tsv.gz"
+
+S10_chrom_assay <- CreateChromatinAssay(
+  counts = S10_atac_counts,
+  sep = c(":", "-"),
+  #genome = 'hg38', # see github issue with Signac, above
+  fragments = S10_frag.file,
+  min.cells = 10,
+  annotation = S10_annotations
+)
+S10[["ATAC"]] <- S10_chrom_assay
+
+# Para
+###########################S11#############################################
+# extract RNA and ATAC data
+S11_rna_counts <- S11$`Gene Expression`
+S11_atac_counts <- S11$Peaks
+
+# Create Seurat object
+S11 <- CreateSeuratObject(counts = S11_rna_counts)
+S11[["percent.mt"]] <- PercentageFeatureSet(S11, pattern = "^MT-")
+
+# Now add in the ATAC-seq data
+# we'll only use peaks in standard chromosomes
+S11_grange.counts <- StringToGRanges(rownames(S11_atac_counts), sep = c(":", "-"))
+S11_grange.use <- seqnames(S11_grange.counts) %in% standardChromosomes(S11_grange.counts)
+S11_atac_counts <- S11_atac_counts[as.vector(S11_grange.use), ]
+S11_annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+# The order of commands has been flipped here, based on this thread- https://github.com/stuart-lab/signac/issues/826 to avoid erros with the genomeInfoDb package that use a newer version of the hg38
+genome(S11_annotations) <- "hg38"
+seqlevelsStyle(S11_annotations) <- 'UCSC'
+
+S11_frag.file <- "~/Desktop/R21 Sterile Immunity data and scripts/Multiome/Batch 1- 29th June 2022/Frag files/Kali0593_Parasitemic/atac_fragments.tsv.gz"
+
+S11_chrom_assay <- CreateChromatinAssay(
+  counts = S11_atac_counts,
+  sep = c(":", "-"),
+  #genome = 'hg38', # see github issue with Signac, above
+  fragments = S11_frag.file,
+  min.cells = 10,
+  annotation = S11_annotations
+)
+S11[["ATAC"]] <- S11_chrom_assay
+
+###########################S12#############################################
+# extract RNA and ATAC data
+S12_rna_counts <- S12$`Gene Expression`
+S12_atac_counts <- S12$Peaks
+
+# Create Seurat object
+S12 <- CreateSeuratObject(counts = S12_rna_counts)
+S12[["percent.mt"]] <- PercentageFeatureSet(S12, pattern = "^MT-")
+
+# Now add in the ATAC-seq data
+# we'll only use peaks in standard chromosomes
+S12_grange.counts <- StringToGRanges(rownames(S12_atac_counts), sep = c(":", "-"))
+S12_grange.use <- seqnames(S12_grange.counts) %in% standardChromosomes(S12_grange.counts)
+S12_atac_counts <- S12_atac_counts[as.vector(S12_grange.use), ]
+S12_annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+# The order of commands has been flipped here, based on this thread- https://github.com/stuart-lab/signac/issues/826 to avoid erros with the genomeInfoDb package that use a newer version of the hg38
+genome(S12_annotations) <- "hg38"
+seqlevelsStyle(S12_annotations) <- 'UCSC'
+
+S12_frag.file <- "~/Desktop/R21 Sterile Immunity data and scripts/Multiome/Batch 1- 29th June 2022/Frag files/Kali0600_Parasitemic/atac_fragments.tsv.gz"
+
+S12_chrom_assay <- CreateChromatinAssay(
+  counts = S12_atac_counts,
+  sep = c(":", "-"),
+  #genome = 'hg38', # see github issue with Signac, above
+  fragments = S12_frag.file,
+  min.cells = 10,
+  annotation = S12_annotations
+)
+S12[["ATAC"]] <- S12_chrom_assay
+
+
+# Jan 2023
+# Apara
+###########################S13#############################################
+# extract RNA and ATAC data
+S13_rna_counts <- S13$`Gene Expression`
+S13_atac_counts <- S13$Peaks
+
+# Create Seurat object
+S13 <- CreateSeuratObject(counts = S13_rna_counts)
+S13[["percent.mt"]] <- PercentageFeatureSet(S13, pattern = "^MT-")
+
+# Now add in the ATAC-seq data
+# we'll only use peaks in standard chromosomes
+S13_grange.counts <- StringToGRanges(rownames(S13_atac_counts), sep = c(":", "-"))
+S13_grange.use <- seqnames(S13_grange.counts) %in% standardChromosomes(S13_grange.counts)
+S13_atac_counts <- S13_atac_counts[as.vector(S13_grange.use), ]
+S13_annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+# The order of commands has been flipped here, based on this thread- https://github.com/stuart-lab/signac/issues/826 to avoid erros with the genomeInfoDb package that use a newer version of the hg38
+genome(S13_annotations) <- "hg38"
+seqlevelsStyle(S13_annotations) <- 'UCSC'
+
+S13_frag.file <- "~/Desktop/R21 Sterile Immunity data and scripts/Multiome/Batch 2- 11th 12th January 2023/Frag files/S2_Kali0647_Apara_exvivo/S2_Kali0647_atac_fragments.tsv.gz"
+
+S13_chrom_assay <- CreateChromatinAssay(
+  counts = S13_atac_counts,
+  sep = c(":", "-"),
+  #genome = 'hg38', # see github issue with Signac, above
+  fragments = S13_frag.file,
+  min.cells = 10,
+  annotation = S13_annotations
+)
+S13[["ATAC"]] <- S13_chrom_assay
+
+# Para
+###########################S14#############################################
+# extract RNA and ATAC data
+S14_rna_counts <- S14$`Gene Expression`
+S14_atac_counts <- S14$Peaks
+
+# Create Seurat object
+S14 <- CreateSeuratObject(counts = S14_rna_counts)
+S14[["percent.mt"]] <- PercentageFeatureSet(S14, pattern = "^MT-")
+
+# Now add in the ATAC-seq data
+# we'll only use peaks in standard chromosomes
+S14_grange.counts <- StringToGRanges(rownames(S14_atac_counts), sep = c(":", "-"))
+S14_grange.use <- seqnames(S14_grange.counts) %in% standardChromosomes(S14_grange.counts)
+S14_atac_counts <- S14_atac_counts[as.vector(S14_grange.use), ]
+S14_annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+# The order of commands has been flipped here, based on this thread- https://github.com/stuart-lab/signac/issues/826 to avoid erros with the genomeInfoDb package that use a newer version of the hg38
+genome(S14_annotations) <- "hg38"
+seqlevelsStyle(S14_annotations) <- 'UCSC'
+
+S14_frag.file <- "~/Desktop/R21 Sterile Immunity data and scripts/Multiome/Batch 2- 11th 12th January 2023/Frag files/S3_Kali0651_Para_exvivo/S3_Kali0651_atac_fragments.tsv.gz"
+
+S14_chrom_assay <- CreateChromatinAssay(
+  counts = S14_atac_counts,
+  sep = c(":", "-"),
+  #genome = 'hg38', # see github issue with Signac, above
+  fragments = S14_frag.file,
+  min.cells = 10,
+  annotation = S14_annotations
+)
+S14[["ATAC"]] <- S14_chrom_assay
+```
+
+# 2.3 Perform QC on multiome data
+```{r}
+
+# create a list of objects
+multiome.list<-list(S9, S10, S11, S12, S13, S14)
+names(multiome.list)<-c("S9", "S10", "S11", "S12", "S13", "S14")
+
+# Filter, normalize RNA and find variable features
+for (i in 1:length(multiome.list)) {
+  multiome.list[[i]] <- subset(multiome.list[[i]],subset = 
+                                 nCount_ATAC < 7e4 &
+    nCount_ATAC > 5e3 &
+    nCount_RNA < 25000 &
+    nCount_RNA > 1000 &
+    percent.mt < 20)
+}
+
+# Split out into individual objects
+orig_multiome_dims<-table(dim(S9), dim(S10), dim(S11), dim(S12), dim(S13), dim(S14))
+
+S9<-multiome.list$S9
+S10<-multiome.list$S10
+S11<-multiome.list$S11
+S12<-multiome.list$S12
+S13<-multiome.list$S13
+S14<-multiome.list$S14
+
+new_multiome_dims<-table(dim(S9), dim(S10), dim(S11), dim(S12), dim(S13), dim(S14))
+
+View(orig_multiome_dims)
+View(new_multiome_dims)
+```
+
+# Step 3: Add metadata with Subject IDs and assay performed, and batch
+```{r}
+S1$subject_id<-"kali0666"
+S1$assay<-"CITE-seq"
+S1$batch<-"NA-all CITE-seq was done in one batch"
+S1$phenotype<-"Aparasitemic"
+S1$pairing<- "pair_1"
+
+S2$subject_id<-"kali0618"
+S2$assay<-"CITE-seq"
+S2$batch<-"NA-all CITE-seq was done in one batch"
+S2$phenotype<-"Aparasitemic"
+S2$pairing<- "pair_2"
+
+S3$subject_id<-"kali0626"
+S3$assay<-"CITE-seq"
+S3$batch<-"NA-all CITE-seq was done in one batch"
+S3$phenotype<-"Aparasitemic"
+S3$pairing<- "pair_3"
+
+S4$subject_id<-"kali0636"
+S4$assay<-"CITE-seq"
+S4$batch<-"NA-all CITE-seq was done in one batch"
+S4$phenotype<-"Aparasitemic"
+S4$pairing<- "pair_4"
+
+S5$subject_id<-"kali0650"
+S5$assay<-"CITE-seq"
+S5$batch<-"NA-all CITE-seq was done in one batch"
+S5$phenotype<-"Parasitemic"
+S5$pairing<- "pair_1"
+
+S6$subject_id<-"kali0628"
+S6$assay<-"CITE-seq"
+S6$batch<-"NA-all CITE-seq was done in one batch"
+S6$phenotype<-"Parasitemic"
+S6$pairing<- "pair_2"
+
+S7$subject_id<-"kali0640"
+S7$assay<-"CITE-seq"
+S7$batch<-"NA-all CITE-seq was done in one batch"
+S7$phenotype<-"Parasitemic"
+S7$pairing<- "pair_3"
+
+S8$subject_id<-"kali0604"
+S8$assay<-"CITE-seq"
+S8$batch<-"NA-all CITE-seq was done in one batch"
+S8$phenotype<-"Parasitemic"
+S8$pairing<- "pair_4"
+
+S9$subject_id<-"kali0585"
+S9$assay<-"multiome"
+S9$batch<-"batch1"
+S9$phenotype<-"Aparasitemic"
+S9$pairing<- "pair_5"
+
+S10$subject_id<-"kali0631"
+S10$assay<-"multiome"
+S10$batch<-"batch1"
+S10$phenotype<-"Aparasitemic"
+S10$pairing<- "pair_6"
+
+S11$subject_id<-"kali0593"
+S11$assay<-"multiome"
+S11$batch<-"batch1"
+S11$phenotype<-"Parasitemic"
+S11$pairing<- "pair_5"
+
+S12$subject_id<-"kali0600"
+S12$assay<-"multiome"
+S12$batch<-"batch1"
+S12$phenotype<-"Parasitemic"
+S12$pairing<- "pair_6"
+
+S13$subject_id<-"kali0647"
+S13$assay<-"multiome"
+S13$batch<-"batch2"
+S13$phenotype<-"Aparasitemic"
+S13$pairing<- "pair_7"
+
+S14$subject_id<-"kali0651"
+S14$assay<-"multiome"
+S14$batch<-"batch2"
+S14$phenotype<-"Parasitemic"
+S14$pairing<- "pair_7"
+```
+
+# Equalize cell numbers across all samples in pairs by random sampling of larger ones
+```{r}
+## Evaluate the numer of cells in each
+S1 #6896
+S2 #6204
+S3 #5355
+S4 #5847
+S5 #5911
+S6 #7354
+S7 #4429
+S8 #6346
+S9 #6803
+S10 #8448
+S11 #9652
+S12 #8853
+S13 #4834
+S14 #1431
+
+# ssample cells based on pairs; each sex and age matched pair should have the same number of cells. For this analysis, we will leave out Pair 8 (Kali0613 and Kali0612)
+#Pairs:
+#pair_1 = kali0666 (S1), kali0650 (S5)
+#pair_2 = kali0618 (S2), kali0628 (S6)
+#pair_3 = kali0626 (S3), kali0640 (S7)
+#pair_4 = kali0636 (S4), kali0604 (S8)
+#pair_5 = kali0585 (S9), kali0593 (S11)
+#pair_6 = kali0631 (S10), kali0600 (S12)
+#pair_7 = kali0647 (S13), kali0651 (S14)
+set.seed(1000) # check with different seeds
+S1<- S1[, sample(colnames(S1), size = ncol(S5), replace=F)]
+S6<- S6[, sample(colnames(S6), size = ncol(S2), replace=F)]
+S3<- S3[, sample(colnames(S3), size = ncol(S7), replace=F)]
+S8<- S8[, sample(colnames(S8), size = ncol(S4), replace=F)]
+S11<- S11[, sample(colnames(S11), size = ncol(S9), replace=F)]
+S12<- S12[, sample(colnames(S12), size = ncol(S10), replace=F)]
+S13<- S13[, sample(colnames(S13), size = ncol(S14), replace=F)]
+```
+
+# Step 4: Merge all 14 seurat objects
+```{r}
+# set RNA as default for all samples
+
+DefaultAssay(S1)<-"RNA"
+DefaultAssay(S2)<-"RNA"
+DefaultAssay(S3)<-"RNA"
+DefaultAssay(S4)<-"RNA"
+DefaultAssay(S5)<-"RNA"
+DefaultAssay(S6)<-"RNA"
+DefaultAssay(S7)<-"RNA"
+DefaultAssay(S8)<-"RNA"
+DefaultAssay(S9)<-"RNA"
+DefaultAssay(S10)<-"RNA"
+DefaultAssay(S11)<-"RNA"
+DefaultAssay(S12)<-"RNA"
+DefaultAssay(S13)<-"RNA"
+DefaultAssay(S14)<-"RNA"
+
+ster.imm_all <- merge(S1, c(S2, S3, S4, S5, S6, S7, S8, S9, S10, S11, S12, S13, S14), add.cell.ids = c("S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11", "S12", "S13", "S14"), merge.data = TRUE)
+```
+
+# Step 5: Add clinical and epidemiological data
+```{r}
+pheno.dat<-readRDS("~/Desktop/R21 Sterile Immunity data and scripts/Patient Information/Sterile and Clinical Immunity summarized ophenotype data for heatmap of number of episodes.rds")
+survdat_long<-readRDS("~/Desktop/R21 Sterile Immunity data and scripts/Patient Information/Time to parasitemia analysis/kali_survdat_clinmal_2011.rds")
+x<-merge(pheno.dat, survdat_long, by="subj_id")
+ster<-subset(x, Study.Arm=="sterile immunity")
+ster$Age <- signif(as.numeric(ster$calc.age.x), 2)
+ster$Sex <- as.factor(ster$Gender.x)
+ster$Sex <- ifelse(ster$Sex == "Male", 1, 2)
+ster$Weight <- as.numeric(ster$Weight)
+ster$"Age (days)" <- as.numeric(ster$Age)*365.25
+ster <- addWGSR(data = ster, sex = "Sex", firstPart = "Weight", secondPart = "Age (days)", index = "wfa")
+
+# remove unwanted columns
+ster<-ster %>%
+  dplyr::select(., -c("subj_id", "InfClass", "Study.Arm","calc.age.y", "Gender.y", "VisitDate.y", "agegp", "age", "Age", "Sex")) %>%
+          dplyr::rename(., "Gender"="Gender.x") %>%
+  dplyr::rename(., "subject_id"="Subject") %>%
+   dplyr::rename(., "VisitDate"="VisitDate.x") %>%
+  dplyr::rename(., "calc_age"="calc.age.x") %>%
+  dplyr::rename(., "weight_for_age_z"="wfaz") %>%
+  dplyr::select(subject_id:calc_age, age_group, `Age (days)`, weight_for_age_z, EnrollDate:FIRST)
+
+# Select only subjects on which scRNA-seq was done
+sc_apara<- c("kali0666",  "kali0618" ,"kali0626" ,"kali0636" , "kali0585",  "kali0631" , "kali0647")
+ sc_para<- c("kali0650", "kali0628", "kali0640", "kali0604", "kali0593", "kali0600", "kali0651")
+ sc<-c(sc_apara, sc_para)
+sc_metadat<-subset(ster, ster$subject_id %in% sc)
+```
+
+# Merge subjects' clinical data to the metadata
+```{r}
+add_data <- left_join(ster.imm_all[["subject_id"]], sc_metadat)
+row.names(add_data) <- row.names(ster.imm_all[[]])
+ster.imm_all <- AddMetaData(ster.imm_all, metadata = add_data)
+
+# save the merged, annotated object before proceeding with celltype annotation and dimensionality reduction
+#saveRDS(ster.imm_all, "~/Desktop/R21 Sterile Immunity Data and Scripts/All scRNA-seq GEX consolidated (CITE-exvivo and multiome)/SterImm_14samples_78kcells_merged_RNA_HTO_ADT_peak_unintegrated_05_28_2024.rds")
+```
+
+# Integrate and reduce data
+```{r}
+# import the unintegrated object
+#sterimm_all<-readRDS("~/Desktop/R21 Sterile Immunity Data and Scripts/All scRNA-seq GEX consolidated (CITE-exvivo and multiome)/SterImm_14samples_78kcells_merged_RNA_HTO_ADT_peak_unintegrated_05_28_2024.rds")
+
+Layers(sterimm_all[["RNA"]])
+sterimm_all[["RNA"]] <- JoinLayers(sterimm_all[["RNA"]])
+Layers(sterimm_all[["RNA"]])
+
+# Reference map using Azimuth
+DefaultAssay(ster.imm_all)<-"RNA"
+sterimm_all <- RunAzimuth(sterimm_all, reference = "pbmcref")
+
+# Split back out
+sterimm_all[["RNA"]] <- split(sterimm_all[["RNA"]], f = sterimm_all$subject_id)
+sterimm_all <- NormalizeData(sterimm_all)
+sterimm_all <- FindVariableFeatures(sterimm_all)
+sterimm_all <- ScaleData(sterimm_all)
+sterimm_all <- RunPCA(sterimm_all)
+sterimm_all <- FindNeighbors(sterimm_all, dims = 1:30, reduction = "pca")
+sterimm_all <- FindClusters(sterimm_all, resolution = 2, cluster.name = "unintegrated_clusters")
+sterimm_all <- RunUMAP(sterimm_all, dims = 1:30, reduction = "pca", reduction.name = "umap.unintegrated")
+
+# CCA integration, similar to finding anchors
+sterimm_all <- IntegrateLayers(
+  object = sterimm_all, method = CCAIntegration,
+  orig.reduction = "pca", new.reduction = "integrated.cca",
+  verbose = FALSE
+)
+
+sterimm_all <- FindNeighbors(sterimm_all, reduction = "integrated.cca", dims = 1:30)
+sterimm_all<- FindClusters(sterimm_all, resolution = 2, cluster.name = "cca_clusters")
+
+sterimm_all <- RunUMAP(sterimm_all, reduction = "integrated.cca", dims = 1:30, reduction.name = "umap.cca")
+
+plot<-DimPlot(
+  sterimm_all,
+  reduction = "umap.cca",
+  group.by = c("subject_id", "predicted.celltype.l2", "cca_clusters"),
+  combine = FALSE, label.size = 2
+)
+
+cellmap_ccaintegrated<-table(sterimm_all$predicted.celltype.l2, sterimm_all$subject_id)
+
+# Finally, join layers again
+sterimm_all<- JoinLayers(sterimm_all)
+saveRDS(sterimm_all, "~/Desktop/R21 Sterile Immunity Data and Scripts/All scRNA-seq GEX consolidated (CITE-exvivo and multiome)/SterImm_14samples_78kcells_integrated_reduced_annoted_RNA_HTO_ADT_peak05_29_2024.rds")
+```
+

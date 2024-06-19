@@ -1,0 +1,514 @@
+---
+title: "R21 Sterile Immunity 78K object edgeR DGE and GSEA June 2024"
+author: "Prasida Holla"
+date: "2024-06-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#load packages
+```{r}
+library(Seurat) 
+library(patchwork)
+library(SeuratDisk)
+library(tidyverse)
+library(magrittr)
+library(googledrive)
+library(ggpubr)
+library(scales)
+library(RColorBrewer)
+library(viridis)
+library(scRNAseq)
+library(scran)
+library(Glimma)
+library(edgeR)
+#library(scater) #cannot install this package for some reason
+library(SingleCellExperiment)
+library(Matrix.utils)
+```
+
+#Import the 78k seurat object
+```{r}
+refmapped_seurat<-readRDS("~/Desktop/R21 Sterile Immunity Data and Scripts/All scRNA-seq GEX consolidated (CITE-exvivo and multiome)/SterImm_14samples_78kcells_integrated_reduced_annoted_RNA_HTO_ADT_peak05_29_2024.rds")
+```
+
+### subset and extract the cells from a Seurat object
+
+```{r, subset and extract from seurat}
+# Extract raw counts and metadata to create SingleCellExperiment object
+counts <- refmapped_seurat@assays$RNA$counts 
+
+metadata <- refmapped_seurat@meta.data
+
+# Set up metadata as desired for aggregation and DE analysis
+refmapped_seurat <- SetIdent(refmapped_seurat, value = factor(gsub("\\_"," ", refmapped_seurat@meta.data$predicted.celltype.l2)))
+metadata$cluster_id <- factor(refmapped_seurat@active.ident)
+metadata <- metadata %>%
+  dplyr::rename(sample_id = "subject_id",
+                class = "phenotype") %>%
+  mutate(class = factor(tolower(class))) %>%
+  dplyr::rename(experiment_mode = "assay")
+
+# Create single cell experiment object
+sce <- SingleCellExperiment(assays = list(counts = counts), 
+                           colData = metadata)
+
+#change colnames of coldata to more r friendy names
+colnames(colData(sce)) <- gsub("\\.","_",  colnames(colData(sce)))
+
+# Identify groups for aggregation of counts
+groups <- colData(sce)[, c("cluster_id", "sample_id", "predicted_celltype_l2")] #predicted_celltype_l2 is lower level clustering
+```
+
+### acquiring necessary metrics for aggregation across cells in a sample
+
+```{r, acquire metrics}
+# Named vector of cluster names
+kids <- purrr::set_names(levels(sce$cluster_id))
+kids
+
+# Total number of clusters
+nk <- length(kids)
+nk
+
+# Named vector of sample names
+sids <- purrr::set_names(levels(factor(sce$sample_id)))
+
+# Total number of samples 
+ns <- length(sids)
+ns
+
+# Generate sample level metadata
+
+## Determine the number of cells per sample
+table(sce$sample_id)
+table(sce$experiment_mode)
+## Turn named vector into a numeric vector of number of cells per sample
+n_cells <- as.numeric(table(sce$sample_id))
+
+## Determine how to reorder the samples (rows) of the metadata to match the order of sample names in sids vector
+m <- match(sids, sce$sample_id)
+
+## Create the sample level metadata by combining the reordered metadata with the number of cells corresponding to each sample.
+ei <- data.frame(colData(sce)[m, ], 
+                  n_cells, row.names = NULL) %>% 
+                dplyr::select(-"cluster_id")
+ei %>%
+  dplyr::select(class, sample_id, n_cells)
+```
+
+### Remove low quality genes 
+
+(re-read vignette to important points)
+
+```{r, remove low quality using scater}
+#skip because can't install scater
+# Perform QC if not already performed
+dim(sce)
+
+# Calculate quality control (QC) metrics
+#sce <- calculateQCMetrics(sce)
+
+# Get cells w/ few/many detected genes
+#sce$is_outlier <- isOutlier(
+#        metric = sce$total_features_by_counts,
+#        nmads = 2, type = "both", log = TRUE)
+
+# Remove outlier cells
+#sce <- sce[, !sce$is_outlier]
+```
+
+```{r, remove lowly expressed genes}
+## Remove lowly expressed genes which have less than 10 cells with any counts
+dim(sce)
+sce <- sce[rowSums(counts(sce) > 1) >= 10, ]
+dim(sce)
+```
+
+## Count aggregation to sample level
+
+```{r, count aggregation to sample level}
+# Aggregate the counts per sample_id and cluster_id
+
+# Subset metadata to only include the cluster and sample IDs to aggregate across
+groups <- colData(sce)[, c("cluster_id", "sample_id")]
+
+# Aggregate across cluster-sample groups
+pb <- aggregate.Matrix(t(counts(sce)), 
+                       groupings = groups, fun = "sum") 
+
+class(pb)
+
+dim(pb)
+
+pb[1:6, 1:6]
+```
+
+### Split data by cell type
+
+```{r split data by cell type}
+# Not every cluster is present in all samples; create a vector that represents how to split samples
+splitf <- sapply(stringr::str_split(rownames(pb), 
+                                    pattern = "_(?!.*_)",
+                                    n = 2), 
+                 `[`, 1)
+
+# Turn into a list and split the list into components for each cluster and transform, so rows are genes and columns are samples and make rownames as the sample IDs
+pb <- split.data.frame(pb, 
+                       factor(splitf)) %>%
+        lapply(function(u) 
+                set_colnames(t(u), 
+                             stringr::str_extract(rownames(u), "(?<=_)[:alnum:]+")))
+
+class(pb)
+
+# Explore the different components of list
+str(pb)
+```
+
+### Check counts per sample for each cluster
+
+```{r, check counts per sample for each cluster}
+# Print out the table of cells in each cluster-sample group
+options(width = 100)
+table(sce$cluster_id, sce$sample_id)
+colSums(table(sce$cluster_id, sce$sample_id))
+
+cell_types_above_200 <- levels(sce$cluster_id)[colSums(t(table(sce$cluster_id, sce$sample_id))) > 200] #limit to cell types with enough cells
+```
+
+## Prepare sample-level metadata for DE anaylsis
+
+```{r, prepare sample level metadata}
+# Get sample names for each of the cell type clusters
+
+# prep. data.frame for plotting
+get_sample_ids <- function(x){
+        pb[[x]] %>%
+                colnames()
+}
+
+de_samples <- map(1:length(kids), get_sample_ids) %>%
+        unlist()
+
+# Get cluster IDs for each of the samples
+
+samples_list <- map(1:length(kids), get_sample_ids)
+
+get_cluster_ids <- function(x){
+        rep(names(pb)[x], 
+            each = length(samples_list[[x]]))
+}
+
+de_cluster_ids <- map(1:length(kids), get_cluster_ids) %>%
+        unlist()
+
+# Create a data frame with the sample IDs, cluster IDs and condition
+gg_df <- data.frame(cluster_id = de_cluster_ids,
+                    sample_id = de_samples)
+
+gg_df <- left_join(gg_df, ei[, c("sample_id", "class")]) 
+
+
+metadata <- gg_df %>%
+        dplyr::select(cluster_id, sample_id, class) 
+        
+metadata 
+```
+
+### Subsetting dataset to cluster(s) of interest
+
+```{r subset to clusters of interest}
+# Generate vector of cluster IDs
+clusters <- levels(factor(metadata$cluster_id))
+clusters
+```
+
+Subset on celltype of interest and run edgeR as a loop
+
+https://bioconductor.org/packages/release/bioc/vignettes/Glimma/inst/doc/single_cell_edger.html
+
+```{r subset on celltype of interest then run DESeq2 all in a loop}
+#read in gene set lists
+temp <- tempfile(fileext = ".rds")
+dl <- drive_download(
+  as_id("1dgWYR5U1iNHb_O8xqogFEXkqSp9430sE"), path = temp, overwrite = TRUE)
+hallmark_geneset<- readRDS(file = dl$local_path)
+
+temp <- tempfile(fileext = ".rds")
+dl <- drive_download(
+  as_id("1dg1mK92esUefeIuIhCtTvFLKP6yjRpQr"), path = temp, overwrite = TRUE)
+kegg_geneset<- readRDS(file = dl$local_path)
+
+#temp <- tempfile(fileext = ".rds")
+#dl <- drive_download(
+#  as_id("1GcGvPi35GTm-DawZ4C7zwhzF1KBLG-pF"), path = temp, overwrite = TRUE)
+#c5_GO_geneset<- readRDS(file = dl$local_path)
+
+temp <- tempfile(fileext = ".rds")
+dl <- drive_download(
+  as_id("1dfACDDCD4qXeW2tDxeSDv0DnMBEzSPhP"), path = temp, overwrite = TRUE)
+biocarta_geneset<- readRDS(file = dl$local_path)
+
+#include #trained monocyte signature is obtained from Dobbs et al JCI Insight 2017 (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5621919/) as the genes that are upregulated in monocytes during acute malaria and recovery compared to North American controls (shown in Figure 8b)
+train_mon_overlap<-list(c("IL1A", "IL1B", "IL6", "CXCL8", "TNF", "CSF3", "ICAM1", "CD80", "TICAM1", "IRAK1", "IRAK2", "JAK1", "KLF2", "NFKB2", "NFKBIA", "RELA", "RELB", "ACKR3", "IFITM3", "C3AR1", "C1QB"))
+recov_mon<-list(c("CCL2", "CCL22", "CCL24", "CCL7", "CCR1", "CCR5", "CXCL1", "CXCL10", "CXCL16", "CXCL2", "CXCL3", "CXCL8", "CXCR4", "CD209", "CLEC7A", "IL1RN", "IL6R", "TGFB1", "TLR3", "NLRP3", "LY86", "MMP9", "SOCS3", "CD86" , "CIITA", "CTLA4", "VEGFA", "HDAC9", "HIF1A", "KLF4", "REL", "STAT1", "STAT4"))
+
+#include p53 Fischer gene signature
+fischer_p53<-read.csv("~/Desktop/p53 R01 related analysis/fischer_fl_genelist.txt", sep="\t", header = F)
+fischer_p53<-list(fischer_p53[,1])
+names(fischer_p53)<-"fischer_p53"
+
+toptags_tbl <- pb_camera_hall <- pb_camera_kegg <-  pb_camera_biocarta <- pb_mroast_trained_mon_rec <- pb_mroast_trained_mon_overlap <- pb_mroast_p53fischer <- pb_qlf <- pb_qlfit <- pb_lrt <- pb_fit <- contr <- design <- dge_pb <- counts <- cluster_counts <- cluster_metadata <- sapply(cell_types_above_200, function(x) NULL)
+#for(i in cell_types_above_200){
+for(i in cell_types_above_200){
+  cluster_metadata[[i]] <- metadata[which(metadata$cluster_id == i), ]
+  #head(cluster_metadata[[i]] )
+  # Assign the rownames of the metadata to be the sample IDs
+  rownames(cluster_metadata[[i]]) <- cluster_metadata[[i]]$sample_id
+  #head(cluster_metadata[[i]] )
+  # Subset the counts to only the "Mono"
+  counts[[i]] <- pb[[i]]
+  cluster_counts[[i]] <- data.frame(counts[[i]][, which(colnames(counts[[i]]) %in% rownames(cluster_metadata[[i]]))])
+  # Check that all of the row names of the metadata are the same and in the same order as the column names of the counts in order to use as input to DESeq2
+  if(all(rownames(cluster_metadata[[i]]) == colnames(cluster_counts[[i]]))){
+    print(paste0("all good for ", i, "!"))
+  }
+  dge_pb[[i]] <- DGEList(counts = cluster_counts[[i]],
+                      samples = cluster_metadata[[i]],
+                      group = cluster_metadata[[i]]$class)
+  dge_pb[[i]] <- calcNormFactors(dge_pb[[i]])
+  design[[i]] <- model.matrix(~0 + class, data = dge_pb[[i]]$samples)
+  colnames(design[[i]]) <- make.names(gsub("class", "", colnames(design[[i]])))
+  dge_pb[[i]] <- estimateDisp(dge_pb[[i]], design[[i]])
+  contr[[i]] <- makeContrasts(aparasitemic - parasitemic, levels = design[[i]])
+  print(paste0("comparison for ", i, " is ", colnames(contr[[i]])))
+  print(paste0("running glmFit for ", i))
+  pb_fit[[i]] <- glmFit(dge_pb[[i]], design[[i]], robust=TRUE)
+  print(paste0("running glmLRT for ", i))
+  pb_lrt[[i]] <- glmLRT(pb_fit[[i]], contrast = contr[[i]])
+  print(paste0("running glmQLFit for ", i))
+  pb_qlfit[[i]] <- glmQLFit(dge_pb[[i]], design[[i]], robust=TRUE)
+  print(paste0("running glmQLFTest for ", i))
+  pb_qlf[[i]] <- glmQLFTest(pb_qlfit[[i]], contrast = contr[[i]])
+  print(paste0("running CAMERA with ", deparse(substitute(c5_GO_geneset)) ," for ", i))
+  pb_camera_hall[[i]] <- camera(dge_pb[[i]], index = hallmark_geneset, design = design[[i]], contrast = contr[[i]]) #hallmark
+  pb_camera_kegg[[i]] <- camera(dge_pb[[i]], index = kegg_geneset, design = design[[i]], contrast = contr[[i]]) #kegg
+  #pb_camera_c5_go[[i]] <- camera(dge_pb[[i]], index = c5_GO_geneset, design = design[[i]], contrast = contr[[i]]) # c5_go
+  pb_camera_biocarta[[i]] <- camera(dge_pb[[i]], index = biocarta_geneset, design = design[[i]], contrast = contr[[i]]) # biocarta
+   pb_mroast_p53fischer[[i]] <- mroast(dge_pb[[i]], index = fischer_p53, design = design[[i]], contrast = contr[[i]]) #fischer_p53
+   pb_mroast_trained_mon_rec[[i]] <- mroast(dge_pb[[i]], index = recov_mon, design = design[[i]], contrast = contr[[i]]) #recovered_monocytes_dobbs
+    pb_mroast_trained_mon_overlap[[i]] <- mroast(dge_pb[[i]], index = train_mon_overlap, design = design[[i]], contrast = contr[[i]]) #monocytes_overlap_genes_acute_recovery_dobbs
+  toptags_tbl[[i]] <- topTags(pb_qlf[[i]], n = nrow(pb_qlf[[i]]))
+}
+```
+### Bind all data frames into single dataframe with cell_type column
+
+```{r, de tables}
+toptags_dfs <- toptags_tbl
+for(i in cell_types_above_200){
+  toptags_dfs[[i]] <- toptags_tbl[[i]]$table %>%
+    rownames_to_column(var = "gene_symbol") %>%
+    dplyr::select(gene_symbol, everything())
+}
+# Turn the results object into a tibble for use with tidyverse functions
+toptags_tbl_bound <- bind_rows(toptags_dfs, .id = "cell_type")
+
+# CAMERA Hallmark results
+camera_hall <- imap(pb_camera_hall, ~.x %>%
+  rownames_to_column(., "pathway"))
+camera_hall_df <- bind_rows(camera_hall, .id="celltype")
+
+#CAMERA KEGG
+camera_kegg <- imap(pb_camera_kegg, ~.x %>%
+  rownames_to_column(., "pathway"))
+camera_kegg_df <- bind_rows(camera_kegg, .id="celltype")
+
+#CAMERA BIOCARTA
+camera_biocarta <- imap(pb_camera_biocarta, ~.x %>%
+  rownames_to_column(., "pathway"))
+camera_biocarta_df <- bind_rows(camera_biocarta, .id="celltype")
+
+#mroast p53 Fischer
+mroast_p53_df <- bind_rows(pb_mroast_p53fischer, .id="celltype")
+
+#mroast trained_monocytes
+mroast_trained_monocytes_overlap_df <- bind_rows(pb_mroast_trained_mon_overlap, .id="celltype")
+
+mroast_trained_monocytes_recovery_df <- bind_rows(pb_mroast_trained_mon_rec, .id="celltype")
+
+saveRDS(toptags_dfs, "~/Desktop/R21 Sterile Immunity Data and Scripts/All scRNA-seq GEX consolidated (CITE-exvivo and multiome)/SterImm_edgeR_topdiff_genes_78k_object_Jun_2024.rds")
+
+saveRDS(camera_hall_df, "~/Desktop/R21 Sterile Immunity Data and Scripts/All scRNA-seq GEX consolidated (CITE-exvivo and multiome)/SterImm_edgeR_CAMERA_Hallmark_78k_object_Jun_2024.rds")
+
+saveRDS(camera_kegg_df, "~/Desktop/R21 Sterile Immunity Data and Scripts/All scRNA-seq GEX consolidated (CITE-exvivo and multiome)/SterImm_edgeR_CAMERA_KEGG_78k_object_Jun_2024.rds")
+
+saveRDS(camera_biocarta_df, "~/Desktop/R21 Sterile Immunity Data and Scripts/All scRNA-seq GEX consolidated (CITE-exvivo and multiome)/SterImm_edgeR_CAMERA_Biocarta_78k_object_Jun_2024.rds")
+
+saveRDS(mroast_p53_df, "~/Desktop/R21 Sterile Immunity Data and Scripts/All scRNA-seq GEX consolidated (CITE-exvivo and multiome)/SterImm_edgeR_mroast_p53sig_78k_object_Jun_2024.rds")
+
+
+saveRDS(mroast_trained_monocytes_overlap_df, "~/Desktop/R21 Sterile Immunity Data and Scripts/Monocyte reclustering analysis/SterImm_edgeR_mroast_trained_monocyte_overlap_recov_acute_vs_NAC_78k_object_Jun_2024.rds")
+
+saveRDS(mroast_trained_monocytes_recovery_df, "~/Desktop/R21 Sterile Immunity Data and Scripts/Monocyte reclustering analysis/SterImm_edgeR_mroast_trained_monocyte_recov_vs_acute_78k_object_Jun_2024.rds")
+```
+
+#Run GSEA
+```{r}
+toptags_ranks<-imap(toptags_dfs, ~.x %>%
+  mutate(rankmetric = -log10(.$PValue)*sign(.$logFC)) %>%
+  dplyr::select(gene_symbol,rankmetric) %>%
+  na.omit() %>%
+  distinct() %>%
+  group_by(gene_symbol) %>%
+  dplyr::summarize(rankmetric = mean(rankmetric)) %>%
+  #dplyr::filter_all(all_vars(is.finite(.)))%>%
+  arrange(desc(rankmetric)) %>%
+  deframe())
+
+devtools::source_url("https://github.com/TranLab/ModuleLists/blob/main/NamedGeneRankList2GseaTable.R?raw=TRUE")
+
+# This connection throws an error, so consider breaking into smaller lists for running
+
+mono<-list(toptags_ranks$`CD14 Mono`, toptags_ranks$`CD16 Mono`)
+names<-c("CD14 Mono", "CD16 Mono")
+names(mono)<-names
+
+toptags_gsea_mono<-lapply(names(mono),
+                     function (x) NamedGeneRankList2GseaTable(rankedgenes = mono[[x]],
+                                           geneset = "all",
+                                           output_directory = tempdir(),
+                                           filename_prefix = "GSEA",
+                                           sampleSize = 101,
+                                           minSize = 20,
+                                           maxSize = Inf,
+                                           scoreType = "std")
+)
+
+toptags_gsea_mono<- imap(toptags_gsea_mono, ~.x %>%
+  as_tibble() %>%
+  arrange(desc(NES)) %>% 
+  dplyr::select(module_type, pathway, ES, NES, size, leadingEdge, pval, padj) %>% 
+  mutate(leadingEdge = gsub("^c\\(|\\)$", "", leadingEdge)) %>%
+  mutate(leadingEdge = gsub('"', "", leadingEdge)) %>%
+  arrange(padj)%>%
+  #filter(padj < 0.20) %>%
+  filter(!grepl("TBA", pathway)) %>%
+  dplyr::select( module_type, pathway, leadingEdge, size, NES, padj) %>%
+  mutate(neglogpadj = -log10(padj)) %>%
+  mutate(pathway = gsub("gd", "γδ", pathway)) %>%
+  mutate(pathway = gsub("Vd2", "Vδ2", pathway)) %>%
+  mutate(pathway = gsub("Vg", "Vγ", pathway)) %>%
+  mutate(pathway = gsub("HALLMARK_", "", pathway)) %>%
+  mutate(pathway = gsub("_", " ", pathway)) %>%
+  mutate(pathway = sub(".*?\\_", "", pathway)) %>%
+  group_by(module_type) %>%
+  #mutate(pathway = fct_reorder(pathway, NES, .desc = TRUE)) %>%
+  ungroup() %>%
+  filter(!grepl("TBD", pathway)) %>%
+  arrange(desc(neglogpadj)) %>%
+  droplevels()
+)
+
+names(toptags_gsea_mono)<-names
+
+
+```
+
+#Create bubbleplot for CAMERA results
+```{r}
+basetextsize <- 8
+myfont <- "sans"
+bubble_max_size <- 16
+mycolors = c("Up" = "red","Down"="blue")
+
+camera_hall_df <- camera_hall_df %>%
+  mutate(pathway = sub(".+?\\_", "", pathway))
+
+camera_hall_df_filtered <- camera_hall_df %>%
+ # mutate(neglog10pval = -log10(PValue)) %>%
+  #arrange(desc(neglog10pval)) %>%
+  dplyr::filter(FDR < 0.01)%>%
+  dplyr::filter(celltype !="dnT")
+
+
+plot_camera_hm <- camera_hall_df_filtered %>%
+    ggplot(., aes(y = pathway, x = celltype, color = Direction)) +
+    geom_point(aes(size = -log10(FDR)), alpha = 0.65) + scale_size_area(name = expression(-log[10]~adj.~p~value), max_size = bubble_max_size) +
+    scale_color_manual(values=mycolors, name = "Aparasitemic vs Parasitemic-EdgeR CAMERA FDR 0.05 cutoff") +
+    #ggtitle(colnames(contr[[i]])) +
+    hrbrthemes::theme_ipsum_es(base_family = myfont, base_size = basetextsize) +
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          strip.background = element_blank(),
+          legend.position = "bottom",
+          axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+
+    scale_x_discrete(limits = rev) +
+    coord_flip()
+```
+
+#Plotting mroast results for p53, trained monocyte signatures
+```{r}
+basetextsize <- 8
+myfont <- "sans"
+bubble_max_size <- 16
+mycolors = c("Up" = "red","Down"="blue")
+
+############################## trained monocyte signatures ##########################
+# Put both monocyte signature dataframes together
+mroast_trained_monocytes_overlap_df$signature<-"Overlap of acute & recovery monocytes vs North American controls"
+mroast_trained_monocytes_recovery_df$signature<-"acute vs recovery monocytes"
+
+monocyte_sigs_df<-rbind(mroast_trained_monocytes_overlap_df, mroast_trained_monocytes_recovery_df)
+
+monocyte_sigs_df_filtered<-monocyte_sigs_df %>%
+   dplyr::filter(FDR < 0.02)
+
+plot_trainedmon <- monocyte_sigs_df_filtered %>%
+  ggplot(., aes(x = signature, y=celltype, color = Direction)) +
+  geom_point(aes(size = -log10(FDR)), alpha = 1.0) +
+  scale_color_manual(values=mycolors) +
+  ggtitle("aparasitemic vs parasitemic: trained monocyte signature: 2% FDR cutoff") +
+  theme_linedraw() + 
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.major.y = element_line( linewidth=.1, color="grey"),
+        # explicitly set the horizontal lines (or they will disappear too)
+        panel.grid.major.x = element_line( linewidth=.1, color="grey"),
+        plot.margin = margin(t = 1,  # Top margin
+                             r = 0.2,  # Right margin
+                             b = 0.2,  # Bottom margin
+                             l = 1.5,  # Left margin
+                             unit = "cm")) +
+  scale_x_discrete(limits = rev) +
+  coord_flip()
+
+############################## Fischer p53 signature ##########################
+mroast_p53_df_filtered<-mroast_p53_df %>%
+   dplyr::filter(FDR < 0.2)
+
+mroast_p53_df_filtered$signature <- "p53 regulated genes"
+
+plot_mroast_p53 <- mroast_p53_df_filtered %>%
+  ggplot(., aes(x = signature, y=celltype, color = Direction)) +
+  geom_point(aes(size = -log10(FDR)), alpha = 1.0) +
+  scale_color_manual(values=mycolors) +
+  ggtitle("aparasitemic vs parasitemic: Fischer p53 signature: 20% FDR cutoff") +
+  theme_linedraw() + 
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.major.y = element_line( linewidth=.1, color="grey"),
+        # explicitly set the horizontal lines (or they will disappear too)
+        panel.grid.major.x = element_line( linewidth=.1, color="grey"),
+        plot.margin = margin(t = 1,  # Top margin
+                             r = 0.2,  # Right margin
+                             b = 0.2,  # Bottom margin
+                             l = 1.5,  # Left margin
+                             unit = "cm")) +
+  scale_x_discrete(limits = rev) +
+  coord_flip()
+```
+
